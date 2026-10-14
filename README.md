@@ -1,6 +1,6 @@
 # Krishnan
 
-Krishnan is a Raman measurement GUI with Windows hardware support. Its layout follows the supplied
+Krishnan is a Raman measurement GUI with Windows hardware support, especially for ANDOR Shamrock and CCD. This requires separate ANDOR python wrapper as andor-spectroscopy, which can be bought from the manufacturer. Its layout follows the supplied
 Solis screenshots: a large acquisition plot, wavelength overview, bottom
 exposure/readout controls, and a right-hand grating and batch area. It uses
 Venkata's light wxPython style and its Run/ExperimentSet data model.
@@ -82,7 +82,7 @@ Windows acceptance test. No LAN connection is attempted in this release.
 Use a 64-bit Python 3.12 or newer with a matching wxPython wheel. Install the
 wrapper and GUI in the same environment, from the Venkata checkout:
 
-    python -m pip install -e .\andor-spectroscopy
+    
     python -m pip install -e .\Krishnan
     cd Krishnan
     python -m krishnan
