@@ -1,7 +1,7 @@
 # Krishnan — Raman measurement GUI design
 
 **Status:** design baseline, with first implementation pass described in [IMPLEMENTATION.md](IMPLEMENTATION.md), 12 October 2026  
-**First release:** Windows x64; Andor SDK2 camera `DU401_BVF` (observed serial 33367, 1024 × 127, 26 µm pixels) and Shamrock SR750-A (observed serial SR-3862)  
+**First release:** Windows x64; Andor SDK2 camera `DU401_BVF` (1024 × 127, 26 µm pixels) and Shamrock SR750-A  
 **Relationship to Venkata:** separate acquisition application; shared `Run` and `ExperimentSet` data model and reusable analysis functions  
 **Source of the interface concept:** the supplied hand sketch and the operator's request. The sketch describes desired controls and layout; it is not a hardware capability record.
 

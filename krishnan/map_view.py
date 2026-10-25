@@ -1,4 +1,4 @@
-"""Three-plot map view using Venkata's map, row, and spectral plotters."""
+"""Map above linked angular/row and spectral slices."""
 
 from __future__ import annotations
 
@@ -57,8 +57,11 @@ class MapPanel(wx.Panel):
         controls.Add(first_row, 0, wx.BOTTOM, 4)
         controls.Add(second_row, 0)
         layout.Add(controls, 0, wx.EXPAND | wx.ALL, 5)
-        self.figure = Figure(figsize=(10, 6), facecolor="white")
+        # wx uses the canvas' initial pixel dimensions as its minimum size.
+        # Keep that minimum below the narrow measurement sidebar width.
+        self.figure = Figure(figsize=(5, 5), facecolor="white")
         self.canvas = FigureCanvasWxAgg(self, -1, self.figure)
+        self.canvas.SetMinSize((240, 220))
         self.toolbar = NavigationToolbar2WxAgg(self.canvas)
         self.toolbar.Realize()
         layout.Add(self.toolbar, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
@@ -78,11 +81,9 @@ class MapPanel(wx.Panel):
 
     def _empty(self):
         self.figure.clear()
-        grid = self.figure.add_gridspec(2, 2, width_ratios=(2.25, 1),
-                                        left=0.08, right=0.96, bottom=0.11,
-                                        top=0.94, wspace=0.34, hspace=0.42)
-        panels = ((self.figure.add_subplot(grid[:, 0]), "2D Raman map"),
-                  (self.figure.add_subplot(grid[0, 1]), "Row slice"),
+        grid = self._grid()
+        panels = ((self.figure.add_subplot(grid[0, :2]), "2D Raman map"),
+                  (self.figure.add_subplot(grid[1, 0]), "Polar / row slice"),
                   (self.figure.add_subplot(grid[1, 1]), "Spectral slice"))
         for ax, title in panels:
             ax.set_title(title)
@@ -91,6 +92,12 @@ class MapPanel(wx.Panel):
             ax.text(0.5, 0.5, "Awaiting captures", ha="center", va="center",
                     transform=ax.transAxes, color="#60717D")
         self.canvas.draw_idle()
+
+    def _grid(self):
+        return self.figure.add_gridspec(
+            2, 3, height_ratios=(2.35, 1), width_ratios=(1, 1, 0.055),
+            left=0.12, right=0.89, bottom=0.11, top=0.94,
+            wspace=0.32, hspace=0.53)
 
     def set_measurements(self, saved: list[dict], laser_nm: float | None,
                          raman_axis: bool = False) -> None:
@@ -126,11 +133,10 @@ class MapPanel(wx.Panel):
         if data is None:
             return
         self.figure.clear()
-        grid = self.figure.add_gridspec(2, 2, width_ratios=(2.25, 1),
-                                        left=0.08, right=0.96, bottom=0.11,
-                                        top=0.94, wspace=0.34, hspace=0.42)
-        map_ax = self.figure.add_subplot(grid[:, 0])
-        row_ax = self.figure.add_subplot(grid[0, 1], projection=(
+        grid = self._grid()
+        map_ax = self.figure.add_subplot(grid[0, :2])
+        colorbar_ax = self.figure.add_subplot(grid[0, 2])
+        row_ax = self.figure.add_subplot(grid[1, 0], projection=(
             "polar" if data.is_angular and self.polar.GetValue() else None))
         spectral_ax = self.figure.add_subplot(grid[1, 1])
         self.map_plotter = RamanPlotter2d(map_ax)
@@ -146,7 +152,8 @@ class MapPanel(wx.Panel):
             self.spectral_x, data.rows, data.intensity,
             title="Raman map", xlabel=self.spectral_label,
             row_axis=row_axis, cmap=self.cmap.GetStringSelection(),
-            color_scale="log" if self.log.GetValue() else "linear")
+            color_scale="log" if self.log.GetValue() else "linear",
+            colorbar_ax=colorbar_ax)
         self.map_plotter.set_highlight_mode(
             "click" if self.highlight.GetSelection() == 0 else "none")
         self.map_plotter.set_contrast(self.low.GetValue(), self.high.GetValue())

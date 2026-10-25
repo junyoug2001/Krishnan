@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "krishnan-raman"
+version = "0.1.0"
+description = "Raman acquisition GUI for Andor SDK2/Shamrock with Venkata exports"
+requires-python = ">=3.12"
+dependencies = [
+  "andor-spectroscopy>=0.1.0",
+  "numpy>=2.3.4,<3",
+  "wxPython>=4.2.4",
+  "matplotlib>=3.9",
+  "pandas>=2.2",
+  "h5py>=3.11",
+  "Pillow>=10",
+]
+
+[project.scripts]
+krishnan = "krishnan.gui:main"
+
+[tool.setuptools.packages.find]
+include = ["krishnan*"]
+
+[tool.setuptools.package-data]
+krishnan = ["aravis_network.ps1", "settings.example.json"]

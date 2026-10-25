@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import asdict, replace
 from pathlib import Path
 import json
 import os
@@ -19,6 +19,7 @@ from .core import (
     stitch_tiles, utc_now, write_txt,
 )
 from .processing import correct_cosmics
+from .settings import load_settings
 
 prepare_paths()
 
@@ -28,6 +29,7 @@ from andor_spectroscopy.instrument import Spectrometer
 from andor_spectroscopy.models import (
     AcquisitionConfig, AcquisitionMode, ReadoutConfig, TriggerMode,
 )
+from andor_spectroscopy.native import resolve_dll
 from andor_spectroscopy.sif import SIFReader
 from andor_spectroscopy.simulator import SimulatedCamera
 from andor_spectroscopy.spectrograph import SimulatedSpectrograph, Spectrograph
@@ -46,18 +48,40 @@ class InstrumentWorker:
         self.state = "DISCONNECTED"
         self.stop_event = threading.Event()
         self._live = None
-        self._operation_lock = threading.Lock()
+        self._operation_lock = threading.RLock()
         self._batch_running = False
+        self.camera_shutter_mode: int | None = None
+        self._acquisition_requests = 0
+        self._temperature_last_read_at = 0.0
+        self._last_temperature_payload: dict | None = None
+        self.temperature_interval_s = load_settings()["temperature_interval_s"]
 
     def _state(self, value: str) -> None:
         self.state = value
         self.emit("state", value)
 
     def submit(self, method: str, *args, **kwargs):
-        return self.pool.submit(self._execute, method, args, kwargs)
+        acquisition = method in {"capture", "batch", "resume_batch", "scan", "live"}
+        with self._operation_lock:
+            if method == "set_cooler" and (self.state != "IDLE" or self._acquisition_requests):
+                rejected: Future = Future()
+                rejected.set_exception(RuntimeError(
+                    "Stop acquisition and wait for IDLE before changing the CCD cooler"))
+                return rejected
+            if acquisition:
+                self._acquisition_requests += 1
+            future = self.pool.submit(self._execute, method, args, kwargs)
+            if acquisition:
+                def finished(_done):
+                    with self._operation_lock:
+                        self._acquisition_requests -= 1
+                future.add_done_callback(finished)
+            return future
 
     def _execute(self, method, args, kwargs):
         try:
+            if method == "capture":
+                self.stop_event.clear()
             return getattr(self, method)(*args, **kwargs)
         except Exception as exc:
             if self.stop_event.is_set() and isinstance(
@@ -86,19 +110,47 @@ class InstrumentWorker:
                       if simulation else Spectrograph.open(
                           device=spectrograph_index, backend=backend, sdk_root=sdk_root))
             self.camera, self.optics = camera, optics
+            self.camera_shutter_mode = None
             self.instrument = Spectrometer(camera, optics)
             self.simulated = simulation
             geometry = optics.calibration_geometry()
             matching = geometry[0] == camera.detector[0] and np.isclose(
                 geometry[1], camera.pixel_pitch_um[0], rtol=1e-6)
+            geometry_initialized = False
+            if not matching:
+                # These are SDK working calibration inputs, not motor commands.
+                optics.configure_calibration_geometry(
+                    camera.detector[0], camera.pixel_pitch_um[0])
+                geometry = optics.calibration_geometry()
+                matching = geometry[0] == camera.detector[0] and np.isclose(
+                    geometry[1], camera.pixel_pitch_um[0], rtol=1e-6)
+                geometry_initialized = True
+            temperature_read_started = time.perf_counter()
+            temperature = asdict(camera.temperature())
+            cooler_on = camera.cooler_is_on()
+            temperature_read_duration_ms = round(
+                (time.perf_counter() - temperature_read_started) * 1000, 1)
+            self._temperature_last_read_at = time.monotonic()
+            self._last_temperature_payload = {
+                "reading": temperature, "cooler_on": cooler_on,
+                "observed_utc": utc_now(),
+                "read_duration_ms": temperature_read_duration_ms,
+            }
             inventory = {
                 "camera": asdict(camera.identity),
-                "temperature": asdict(camera.temperature()),
-                "cooler_on": camera.cooler_is_on(),
+                "temperature": temperature,
+                "cooler_on": cooler_on,
+                "temperature_observed_utc": self._last_temperature_payload["observed_utc"],
+                "temperature_read_duration_ms": temperature_read_duration_ms,
                 "gratings": [asdict(g) for g in optics.gratings()],
                 "optical": asdict(optics.snapshot()),
                 "calibration_geometry": geometry,
                 "geometry_matches": bool(matching),
+                "geometry_initialized": geometry_initialized,
+                "sdk_libraries": ({
+                    "camera": str(resolve_dll("sdk2", sdk_root=sdk_root)),
+                    "spectrograph": str(resolve_dll(backend, sdk_root=sdk_root)),
+                } if not simulation else {}),
                 "accessories": {
                     "slits": [n for n in range(1, 5) if optics.slit_present(n)],
                     "shutter": optics.shutter_present(),
@@ -119,18 +171,53 @@ class InstrumentWorker:
             if camera is not None:
                 camera.close()
             self.camera = self.optics = self.instrument = None
+            self.camera_shutter_mode = None
             self._state("DISCONNECTED")
             raise
 
     def disconnect(self) -> None:
         if self.state not in ("IDLE", "FAULT"):
             raise RuntimeError("Stop the current acquisition first")
+        if self.camera is not None and not self.simulated:
+            if self.camera.cooler_is_on():
+                raise RuntimeError("Turn the cooler off and allow the detector to warm before disconnecting")
+            if self.camera.temperature().celsius < -20:
+                raise RuntimeError("Detector is below -20 °C; wait for warm-up before SDK shutdown")
         if self.optics is not None:
             self.optics.close()
         if self.camera is not None:
             self.camera.close()
         self.camera = self.optics = self.instrument = None
+        self.camera_shutter_mode = None
         self._state("DISCONNECTED")
+
+    def begin_orphan_cleanup(self) -> None:
+        """First grace period elapsed: stop measurement and start warm-up."""
+        if self.state in ("LIVE", "ACQUIRING"):
+            raise RuntimeError("Acquisition has not stopped")
+        if self.camera is not None and not self.simulated:
+            if self.camera.cooler_is_on():
+                self.camera.cooler_off()
+            self.emit("temperature", {
+                "reading": asdict(self.camera.temperature()),
+                "cooler_on": self.camera.cooler_is_on(),
+            })
+
+    def finish_orphan_cleanup(self) -> bool:
+        """Return False while a real detector still needs to warm."""
+        if self.camera is not None and not self.simulated:
+            reading = self.camera.temperature()
+            self.emit("temperature", {
+                "reading": asdict(reading),
+                "cooler_on": self.camera.cooler_is_on(),
+            })
+            if self.camera.cooler_is_on():
+                raise RuntimeError("Cooler unexpectedly turned on during unattended warm-up")
+            if reading.celsius < -20:
+                return False
+        if self.camera is not None:
+            self.disconnect()
+        return True
 
     def use_session(self, session: Session) -> None:
         if self.state not in ("IDLE", "DISCONNECTED"):
@@ -192,6 +279,17 @@ class InstrumentWorker:
         if self.state != "IDLE" or self.camera is None or self.optics is None:
             raise RuntimeError("Connect and wait for idle")
 
+    def _require_calibration_geometry(self) -> None:
+        width = self.camera.detector[0]
+        pitch = self.camera.pixel_pitch_um[0]
+        pixels, actual_pitch = self.optics.calibration_geometry()
+        if pixels != width or not np.isclose(actual_pitch, pitch, rtol=1e-6):
+            raise RuntimeError(
+                f"Calibration geometry is {pixels} pixels / {actual_pitch:g} µm; "
+                f"select Set calibration geometry for {width} pixels / {pitch:g} µm "
+                "before an acquisition or optical move"
+            )
+
     def set_grating(self, grating: int) -> None:
         self._need_idle()
         self.instrument.set_grating(grating)
@@ -229,22 +327,32 @@ class InstrumentWorker:
         if setpoint is not None:
             self.camera.set_temperature(setpoint)
         self.camera.cooler_on() if on else self.camera.cooler_off()
-        self.emit("temperature", {
-            "reading": asdict(self.camera.temperature()),
-            "cooler_on": self.camera.cooler_is_on(),
-        })
+        payload = self._temperature_payload()
+        self.emit("temperature", payload)
+        self.emit("status", f"CCD cooler {'on' if payload['cooler_on'] else 'off'} "
+                  + (f"at requested setpoint {setpoint} °C" if on else "(readback)"))
 
     def set_shutter(self, mode: int) -> None:
         self._need_idle()
         self.camera.set_shutter(mode)
+        self.camera_shutter_mode = mode
         self.emit("shutter", mode)
 
     def read_temperature(self) -> None:
         self._need_idle()
-        self.emit("temperature", {
-            "reading": asdict(self.camera.temperature()),
-            "cooler_on": self.camera.cooler_is_on(),
-        })
+        self.emit("temperature", self._temperature_payload())
+
+    def _temperature_payload(self) -> dict:
+        started = time.perf_counter()
+        reading = asdict(self.camera.temperature())
+        cooler_on = self.camera.cooler_is_on()
+        self._temperature_last_read_at = time.monotonic()
+        self._last_temperature_payload = {
+            "reading": reading, "cooler_on": cooler_on,
+            "observed_utc": utc_now(),
+            "read_duration_ms": round((time.perf_counter() - started) * 1000, 1),
+        }
+        return self._last_temperature_payload
 
     def set_accessory(self, kind: str, index: int, value: float) -> None:
         self._need_idle()
@@ -273,22 +381,55 @@ class InstrumentWorker:
             raise ValueError("Unknown accessory")
         self.emit("accessory", {"kind": kind, "index": index, "value": readback})
 
+    def _readout_selection(self, advanced: dict | None):
+        from andor_spectroscopy.models import ReadoutSelection
+        values = advanced or {}
+        # Match Solis' 1x preamp and 8.25 µs vertical shift on this DU401_BVF.
+        # Resolve SDK indices from capabilities rather than assuming their order.
+        native_defaults = {}
+        if not self.simulated:
+            capabilities = self.camera.capabilities()
+            channel = values.get("ad_channel")
+            if channel is None and capabilities.ad_channels:
+                channel = capabilities.ad_channels[0]
+            amplifier = values.get("amplifier")
+            if amplifier is None and capabilities.amplifiers:
+                amplifier = capabilities.amplifiers[0]
+            native_defaults["ad_channel"] = channel
+            native_defaults["amplifier"] = amplifier
+            speeds = capabilities.horizontal_speeds_mhz.get((channel, amplifier), ())
+            native_defaults["hs_index"] = next(
+                (index for index, value in enumerate(speeds)
+                 if np.isclose(value, 0.1, rtol=0, atol=0.001)), None)
+            for key, choices, target in (
+                    ("vs_index", capabilities.vertical_speeds_us, 8.25),
+                    ("preamp_index", capabilities.preamp_gains, 1.0)):
+                native_defaults[key] = next(
+                    (index for index, value in enumerate(choices)
+                     if np.isclose(value, target, rtol=0, atol=0.01)), None)
+        vs_index = values.get("vs_index")
+        preamp_index = values.get("preamp_index")
+        hs_index = values.get("hs_index")
+        selection = ReadoutSelection(
+            native_defaults.get("ad_channel") if values.get("ad_channel") is None
+            else values["ad_channel"],
+            native_defaults.get("amplifier") if values.get("amplifier") is None
+            else values["amplifier"],
+            native_defaults.get("hs_index") if hs_index is None else hs_index,
+            native_defaults.get("vs_index") if vs_index is None else vs_index,
+            native_defaults.get("preamp_index") if preamp_index is None else preamp_index)
+        return None if all(v is None for v in asdict(selection).values()) else selection
+
     def _config(self, step: Step, readout: ReadoutConfig,
                 advanced: dict | None = None) -> AcquisitionConfig:
-        from andor_spectroscopy.models import ReadoutSelection, TriggerMode
         values = advanced or {}
         mode = AcquisitionMode.ACCUMULATE if step.accumulations > 1 else AcquisitionMode.SINGLE
-        selection = ReadoutSelection(
-            values.get("ad_channel"), values.get("amplifier"),
-            values.get("hs_index"), values.get("vs_index"), values.get("preamp_index"))
-        if all(v is None for v in asdict(selection).values()):
-            selection = None
         return AcquisitionConfig(
             step.exposure_s, mode=mode, readout=readout,
             trigger=TriggerMode(values.get("trigger", 0)),
             accumulations=step.accumulations,
             accumulation_cycle_s=step.cycle_s,
-            readout_selection=selection,
+            readout_selection=self._readout_selection(values),
         )
 
     def _save(self, step: Step, config: AcquisitionConfig):
@@ -357,6 +498,7 @@ class InstrumentWorker:
             raise RuntimeError("No batch is running")
         if self.session is None:
             raise RuntimeError("Create or open a session first")
+        self._require_calibration_geometry()
         readout = readout or ReadoutConfig()
         entry = next((s for s in self.session.data["steps"] if s["id"] == step.id), None)
         if entry is None:
@@ -382,15 +524,25 @@ class InstrumentWorker:
             self.session.update(step.id, "acquiring")
             measurement, raw, calibration = self._save(step, config)
             self.session.update(step.id, "verifying")
+            if (self._last_temperature_payload is None or
+                    time.monotonic() - self._temperature_last_read_at >= self.temperature_interval_s):
+                self.emit("temperature", self._temperature_payload())
+            observed_temperature = self._last_temperature_payload
+            assert observed_temperature is not None
             applied = {
                 "exposure_s": measurement.frame.timings.exposure_s,
                 "accumulation_cycle_s": measurement.frame.timings.accumulation_s,
                 "kinetic_cycle_s": measurement.frame.timings.kinetic_s,
                 "grating": self.optics.get_grating(),
                 "center_nm": self.optics.get_wavelength(),
-                "temperature": asdict(self.camera.temperature()),
+                "temperature": observed_temperature["reading"],
+                "cooler_on": observed_temperature["cooler_on"],
+                "temperature_observed_utc": observed_temperature["observed_utc"],
+                "temperature_age_s": round(
+                    time.monotonic() - self._temperature_last_read_at, 2),
                 "readout": asdict(measurement.frame.readout),
                 "trigger": int(config.trigger),
+                "camera_shutter_mode_applied": self.camera_shutter_mode,
                 "readout_selection": (
                     asdict(measurement.frame.readout_selection)
                     if measurement.frame.readout_selection is not None else None),
@@ -556,29 +708,54 @@ class InstrumentWorker:
         return path
 
     def live(self, exposure_s: float, cycle_s: float,
-             readout: ReadoutConfig | None = None) -> None:
+             readout: ReadoutConfig | None = None,
+             advanced: dict | None = None) -> None:
         self._need_idle()
+        self._require_calibration_geometry()
         self.stop_event.clear()
+        cycle_s = max(0.1, cycle_s)
+        if self.simulated:
+            self.camera.frame_interval_s = cycle_s
         config = AcquisitionConfig(
             exposure_s, mode=AcquisitionMode.CONTINUOUS,
-            kinetic_cycle_s=cycle_s, readout=readout or ReadoutConfig())
+            kinetic_cycle_s=cycle_s, readout=readout or ReadoutConfig(),
+            readout_selection=self._readout_selection(advanced))
         self._state("LIVE")
         last_emit = 0.0
+        prior_sdk_lost = 0
+        prior_queue_lost = 0
         try:
-            with self.instrument.stream(config, timeout_s=30, queue_size=32,
-                                        loss_policy="preview") as stream:
-                self._live = stream
-                for measurement in stream:
-                    if self.stop_event.is_set():
-                        break
-                    now = time.monotonic()
-                    if now - last_emit >= 0.1:
-                        self.emit("preview", {
-                            "axis": measurement.wavelength_nm, "data": measurement.data,
-                            "timings": measurement.frame.timings,
-                            "statistics": stream.statistics,
-                        })
-                        last_emit = now
+            while not self.stop_event.is_set():
+                # This DU401 does not advertise SDK2 temperature reads during
+                # acquisition. End each short stream before querying the CCD.
+                if time.monotonic() - self._temperature_last_read_at >= self.temperature_interval_s:
+                    self.emit("temperature", self._temperature_payload())
+                temperature_due = self._temperature_last_read_at + self.temperature_interval_s
+                with self.instrument.stream(config, timeout_s=30, queue_size=32,
+                                            loss_policy="preview") as stream:
+                    self._live = stream
+                    for measurement in stream:
+                        if self.stop_event.is_set():
+                            break
+                        now = time.monotonic()
+                        if now - last_emit >= 0.1:
+                            statistics = stream.statistics
+                            self.emit("preview", {
+                                "axis": measurement.wavelength_nm,
+                                "data": measurement.data,
+                                "timings": measurement.frame.timings,
+                                "statistics": replace(
+                                    statistics,
+                                    sdk_lost=prior_sdk_lost + statistics.sdk_lost,
+                                    queue_lost=prior_queue_lost + statistics.queue_lost),
+                            })
+                            last_emit = now
+                        if now >= temperature_due:
+                            break
+                statistics = stream.statistics
+                prior_sdk_lost += statistics.sdk_lost
+                prior_queue_lost += statistics.queue_lost
+                self._live = None
         except AcquisitionCancelledError:
             if not self.stop_event.is_set():
                 raise
@@ -592,6 +769,11 @@ class InstrumentWorker:
             self.emit("state", "STOPPING")
             if self.camera is not None:
                 self.camera.cancel()
+
+    def software_trigger(self) -> None:
+        if self.state != "ACQUIRING" or self.camera is None:
+            raise RuntimeError("No acquisition is armed for a software trigger")
+        self.camera.software_trigger()
 
     def close(self) -> None:
         self.stop()

@@ -1,9 +1,4 @@
-"""Independent sample-view camera contract and hardware-free implementation.
-
-The LAN device model and protocol have not yet been identified. A future
-transport adapter implements this interface without changing the GUI or the
-Andor spectroscopy worker.
-"""
+"""Sample-view camera contract and simulator, separate from Andor acquisition."""
 
 from __future__ import annotations
 
@@ -51,6 +46,7 @@ class SimulatedAuxiliaryCamera:
         self.sequence = 0
         self.running = False
         self.opened = False
+        self.preview_fps = 10
         y, x = np.mgrid[:height, :width]
         self.x, self.y = x.astype(np.float32), y.astype(np.float32)
 
@@ -70,7 +66,7 @@ class SimulatedAuxiliaryCamera:
     def read_frame(self, timeout_s: float = 1.0) -> CameraFrame:
         if not self.running:
             raise RuntimeError("Camera is stopped")
-        time.sleep(min(0.10, max(0.001, timeout_s)))
+        time.sleep(min(1.0 / self.preview_fps, max(0.001, timeout_s)))
         self.sequence += 1
         x, y = self.x, self.y
         phase = self.sequence * 0.045
@@ -94,7 +90,7 @@ class SimulatedAuxiliaryCamera:
 
 @dataclass(frozen=True)
 class LanCameraProfile:
-    """Identification required before selecting a real LAN transport adapter."""
+    """Optional identification record for a LAN camera transport adapter."""
 
     manufacturer: str = ""
     model: str = ""

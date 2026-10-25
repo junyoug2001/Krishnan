@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
+import os
 import threading
+import time
 import uuid
 
 import numpy as np
@@ -16,12 +19,16 @@ from .bootstrap import prepare_paths
 from .camera_view import CameraPanel
 from .core import Session, Step, repeated_steps
 from .map_view import MapPanel
+from .motor_view import MotorPanel
+from .console_view import ConsolePanel
 from .processing import cosmic_candidates
 from .spectral_color import wavelength_rgb
-from .worker import InstrumentWorker
+from .process_worker import ProcessWorker
+from .settings import load_settings, save_settings
 
 prepare_paths()
 from andor_spectroscopy.models import ReadoutConfig, ReadoutMode
+from andor_spectroscopy.native import resolve_dll
 from data_structure import raman_shift_cm1
 
 
@@ -64,7 +71,15 @@ class WavelengthStrip(wx.Panel):
         self.Bind(wx.EVT_LEFT_DOWN, self.click)
         self.Bind(wx.EVT_MOTION, self.motion)
         self.Bind(wx.EVT_LEFT_UP, self.release)
+        self.Bind(wx.EVT_SIZE, self._resized)
         self.dragging = False
+        self._band_key = None
+        self._band_bitmap = None
+        self._band_bytes = None
+
+    def _resized(self, event):
+        self.Refresh(False)
+        event.Skip()
 
     def paint(self, event):
         dc = wx.AutoBufferedPaintDC(self)
@@ -105,10 +120,18 @@ class WavelengthStrip(wx.Panel):
                             wx.Point(marker_x + 10, 36), wx.Point(marker_x, 46)])
         else:
             dc.DrawText("Center and CCD range unavailable", left, 5)
-        for px in range(left, right):
-            nm = lo + (px - left) / max(1, right - left) * (hi - lo)
-            dc.SetPen(wx.Pen(wx.Colour(*wavelength_rgb(nm))))
-            dc.DrawLine(px, band_y, px, band_y + band_height)
+        band_width = right - left
+        key = (band_width, band_height, lo, hi)
+        if key != self._band_key:
+            row = bytes(channel
+                        for offset in range(band_width)
+                        for channel in wavelength_rgb(
+                            lo + offset / max(1, band_width - 1) * (hi - lo)))
+            self._band_bytes = row * band_height
+            self._band_bitmap = wx.Bitmap.FromBuffer(
+                band_width, band_height, self._band_bytes)
+            self._band_key = key
+        dc.DrawBitmap(self._band_bitmap, left, band_y)
         dc.SetPen(wx.Pen(wx.Colour("#839099"), 1))
         dc.SetBrush(wx.TRANSPARENT_BRUSH)
         dc.DrawRectangle(left, band_y, right - left, band_height + 1)
@@ -437,9 +460,11 @@ class BatchDialog(wx.Dialog):
 
 class MainFrame(wx.Frame):
     def __init__(self):
-        super().__init__(None, title="Krishnan — Raman Measurement", size=(1480, 920))
+        self.settings = load_settings()
+        super().__init__(None, title="Krishnan — Raman Measurement",
+                         size=tuple(self.settings["window_size"]))
         self.SetBackgroundColour(wx.Colour(BG))
-        self.worker = InstrumentWorker(self._post)
+        self.worker = ProcessWorker(self._post)
         self.inventory = None
         self.session = None
         self.readout = ReadoutConfig()
@@ -448,11 +473,17 @@ class MainFrame(wx.Frame):
         self.last = None
         self.live_future = None
         self._angular_export_pending = False
+        self._last_temperature_payload = None
+        self._last_temperature_received = 0.0
+        self._last_temperature_request = 0.0
+        self._temperature_future = None
+        self._auto_cooler_pending = False
+        self._gui_closing = False
         self._build()
         self._set_state("DISCONNECTED")
         self.timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._poll, self.timer)
-        self.timer.Start(5000)
+        self.timer.Start(1000)
         self.Bind(wx.EVT_CLOSE, self._close)
         self.Centre()
         self.Show()
@@ -476,8 +507,8 @@ class MainFrame(wx.Frame):
         title = _label(toolbar, "KRISHNAN", bold=True)
         title.SetForegroundColour(wx.Colour(ORANGE))
         line.Add(title, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT | wx.RIGHT, 15)
-        self.mode = wx.Choice(toolbar, choices=["Simulator", "Native camera"])
-        self.mode.SetSelection(0)
+        self.mode = wx.Choice(toolbar, choices=["Native camera", "Simulator"])
+        self.mode.SetSelection(0 if self.settings["camera_mode"] == "native" else 1)
         line.Add(self.mode, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
         self.connect_button = self._button(toolbar, "Connect", self._connect)
         self.session_button = self._button(toolbar, "New/Open session", self._session)
@@ -524,6 +555,8 @@ class MainFrame(wx.Frame):
         self.camera_panel = CameraPanel(notebook, lambda: self.session.folder
                                         if self.session is not None else None)
         notebook.AddPage(self.camera_panel, "Camera")
+        self.motor_panel = MotorPanel(notebook)
+        notebook.AddPage(self.motor_panel, "Motors")
         step_page = wx.Panel(notebook)
         step_sizer = wx.BoxSizer(wx.VERTICAL)
         self.steps_list = wx.ListCtrl(step_page, style=wx.LC_REPORT | wx.BORDER_SIMPLE)
@@ -551,7 +584,11 @@ class MainFrame(wx.Frame):
         detail_sizer.Add(self.details, 1, wx.EXPAND | wx.ALL, 6)
         detail_page.SetSizer(detail_sizer)
         notebook.AddPage(detail_page, "Details")
-        notebook.ChangeSelection(1)
+        self.console_panel = ConsolePanel(notebook, {
+            "Andor": self._reattach_backend, "Aravis": self.camera_panel.connect_backend,
+            "Thorlabs": lambda: self.motor_panel.command("connect")})
+        notebook.AddPage(self.console_panel, "Console")
+        notebook.ChangeSelection(2)
         notebook.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self._on_tab_changed)
         right_sizer.Add(notebook, 1, wx.EXPAND)
         right.SetSizer(right_sizer)
@@ -561,11 +598,13 @@ class MainFrame(wx.Frame):
         self._bottom(root)
         self.SetSizer(root)
         self.CreateStatusBar()
-        self.SetStatusText("Choose Simulator or Native camera, then Connect.")
+        self.SetStatusText("Select Connect to use the Native camera.")
 
     def _on_tab_changed(self, event):
         name = self.notebook.GetPageText(event.GetSelection())
-        right_width = 960 if name == "Map" else 650 if name == "Camera" else 400
+        right_width = 960 if name == "Map" else 650 if name in ("Camera", "Motors", "Console") else 400
+        if name == "Motors":
+            self.motor_panel.activate()
         width = self.split.GetClientSize().width
         if width > 0:
             self.split.SetSashPosition(max(430, width - right_width))
@@ -578,8 +617,10 @@ class MainFrame(wx.Frame):
         row1 = wx.BoxSizer(wx.HORIZONTAL)
         for label, default, width in (
             ("Sample", "sample", 130), ("Laser nm", "", 70),
-            ("Polarization", "", 95), ("Exposure s", "0.1", 70),
-            ("Cycle s", "0.2", 70), ("Accumulations", "1", 45),
+            ("Polarization", "", 95),
+            ("Exposure s", str(self.settings["exposure_s"]), 70),
+            ("Cycle s", str(self.settings["cycle_s"]), 70),
+            ("Accumulations", str(self.settings["accumulations"]), 45),
         ):
             row1.Add(_label(box, label), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
             control = wx.TextCtrl(box, value=default, size=(width, -1))
@@ -613,18 +654,27 @@ class MainFrame(wx.Frame):
         self.ccd_status = _label(box, "Disconnected")
         row3.Add(self.ccd_status, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 16)
         row3.Add(_label(box, "Setpoint °C"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
-        self.setpoint = wx.TextCtrl(box, value="-50", size=(55, -1))
+        self.setpoint = wx.TextCtrl(box, value=str(self.settings["ccd_setpoint_c"]),
+                                    size=(55, -1))
         row3.Add(self.setpoint, 0, wx.RIGHT, 5)
-        row3.Add(self._button(box, "Cooler on", lambda e: self._cooler(True)), 0, wx.RIGHT, 5)
-        row3.Add(self._button(box, "Cooler off", lambda e: self._cooler(False)), 0, wx.RIGHT, 12)
+        self.cooler_on_button = self._button(box, "Cooler on", lambda e: self._cooler(True))
+        self.cooler_off_button = self._button(box, "Cooler off", lambda e: self._cooler(False))
+        row3.Add(self.cooler_on_button, 0, wx.RIGHT, 5)
+        row3.Add(self.cooler_off_button, 0, wx.RIGHT, 12)
         row3.Add(_label(box, "Camera shutter"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
-        self.shutter = wx.Choice(box, choices=["Closed", "Open", "Automatic"])
-        self.shutter.SetSelection(2)
+        self.shutter = wx.Choice(box, choices=["Unchanged", "Closed", "Open", "Automatic"])
+        self.shutter.SetSelection(0)
         row3.Add(self.shutter, 0, wx.RIGHT, 5)
         row3.Add(self._button(box, "Apply", self._shutter), 0, wx.RIGHT, 15)
         self.accessories = _label(box, "Accessories: —")
         row3.Add(self.accessories, 1, wx.ALIGN_CENTER_VERTICAL)
         outer.Add(row3, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 9)
+        self.auto_cooler = wx.CheckBox(box, label="Cooler on after new Native connection")
+        self.auto_cooler.SetValue(self.settings["cooler_on_new_connection"])
+        self.auto_cooler.Bind(wx.EVT_CHECKBOX, self._auto_cooler_changed)
+        outer.Add(self.auto_cooler, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 9)
+        outer.Add(self._button(box, "SDK folder…", self._choose_sdk_folder),
+                  0, wx.LEFT | wx.BOTTOM, 9)
         future = _label(box, "Sample temperature · magnetic field · angle: controller not configured")
         future.SetForegroundColour(wx.Colour(MUTED))
         outer.Add(future, 0, wx.LEFT | wx.BOTTOM, 9)
@@ -636,35 +686,72 @@ class MainFrame(wx.Frame):
         connected = state in ("IDLE", "LIVE", "ACQUIRING", "STOPPING", "FAULT")
         idle = state == "IDLE"
         self.connect_button.SetLabel("Disconnect" if connected else "Connect")
-        self.connect_button.Enable(state in ("DISCONNECTED", "IDLE", "FAULT"))
+        self.mode.Enable(state == "DISCONNECTED" and not self._auto_cooler_pending)
+        self.connect_button.Enable(state in ("DISCONNECTED", "IDLE", "FAULT")
+                                   and not self._auto_cooler_pending)
         self.session_button.Enable(state in ("DISCONNECTED", "IDLE", "FAULT"))
-        self.live_button.Enable(idle)
-        self.single_button.Enable(idle)
-        self.batch_button.Enable(idle)
+        self.live_button.Enable(idle and not self._auto_cooler_pending)
+        self.single_button.Enable(idle and not self._auto_cooler_pending)
+        self.batch_button.Enable(idle and not self._auto_cooler_pending)
         self.stop_button.Enable(state in ("LIVE", "ACQUIRING", "STOPPING"))
         self.trigger_button.Enable(state == "ACQUIRING"
                                    and self.advanced.get("trigger") == 10)
         self.snapshot_button.Enable(state == "LIVE" and self.session is not None)
-        self.resume_button.Enable(idle and self.session is not None)
+        self.resume_button.Enable(idle and self.session is not None
+                                  and not self._auto_cooler_pending)
+        self.cooler_on_button.Enable(idle and not self._auto_cooler_pending)
+        self.cooler_off_button.Enable(idle and not self._auto_cooler_pending)
+        self.setpoint.Enable(idle and not self._auto_cooler_pending)
         self.export_button.Enable(self.session is not None)
         self.cosmic_button.Enable(idle and bool(self.saved))
         self.SetStatusText(state)
 
     def _submit(self, name, *args, **kwargs):
         future = self.worker.submit(name, *args, **kwargs)
+        if name in {"connect", "capture", "batch", "resume_batch", "live", "set_cooler"}:
+            def report_failure(done):
+                try:
+                    done.result()
+                except Exception as exc:
+                    self._post("operation_error", f"{name}: {exc}")
+            future.add_done_callback(report_failure)
         return future
 
     def _event(self, kind, payload):
         if kind == "state":
             self._set_state(payload)
+            if payload == "DISCONNECTED":
+                self.shutter.SetSelection(0)
+                self._last_temperature_payload = None
+                self.ccd_status.SetLabel("Disconnected")
         elif kind == "error":
             self._angular_export_pending = False
             self.SetStatusText(payload)
             self.details.AppendText(payload + "\n")
+        elif kind == "operation_error":
+            self.SetStatusText(payload)
+            wx.MessageBox(payload, "Krishnan operation failed", wx.OK | wx.ICON_ERROR)
         elif kind == "status":
             self.SetStatusText(payload)
+        elif kind == "attached_session":
+            try:
+                session = Session(payload)
+                self.session = session
+                self.sample.ChangeValue(session.data["sample"])
+                self.laser_nm.ChangeValue(
+                    "" if session.data["laser_nm"] is None else str(session.data["laser_nm"]))
+                self.polarization.ChangeValue(session.data["polarization"])
+                for field in (self.sample, self.laser_nm, self.polarization):
+                    field.SetEditable(False)
+                self._event("steps", session.data["steps"])
+                self._submit("load_completed")
+                self._set_state(self.worker.state)
+                self.SetStatusText(f"Reattached to backend session: {session.folder}")
+            except Exception as exc:
+                self._event("error", f"Could not restore backend session: {exc}")
         elif kind == "inventory":
             self.inventory = payload
+            self.mode.SetSelection(1 if payload["simulation"] else 0)
             self.details.SetValue(str(payload))
             gratings = payload["gratings"]
             self.grating.SetItems([f"{g['index']}: {g['lines_per_mm']:g} l/mm — {g['blaze']}"
@@ -672,10 +759,12 @@ class MainFrame(wx.Frame):
             selected = payload["optical"]["grating"]
             self.grating.SetSelection(max(0, selected - 1))
             self._optical(payload["optical"])
-            cam = payload["camera"]
             temp = payload["temperature"]
-            self.ccd_status.SetLabel(
-                f"{cam['head_model']} #{cam['serial_number']} · {temp['celsius']:.1f} °C ({temp['status']})")
+            self._show_temperature({
+                "reading": temp, "cooler_on": payload["cooler_on"],
+                "observed_utc": payload.get("temperature_observed_utc"),
+                "read_duration_ms": payload.get("temperature_read_duration_ms"),
+            })
             installed = payload["accessories"]
             names = [key for key, value in installed.items() if value]
             self.accessories.SetLabel("Accessories: " + (", ".join(names) or "manual / none"))
@@ -695,9 +784,10 @@ class MainFrame(wx.Frame):
         elif kind == "geometry":
             self.SetStatusText(f"Calibration geometry set: {payload}")
         elif kind == "temperature":
-            info = payload["reading"]
-            self.ccd_status.SetLabel(
-                f"{info['celsius']:.1f} °C ({info['status']}); cooler {'on' if payload['cooler_on'] else 'off'}")
+            self._show_temperature(payload)
+        elif kind == "shutter":
+            self.shutter.SetSelection({2: 1, 1: 2, 0: 3}.get(payload, 0))
+            self.SetStatusText(f"Camera shutter mode applied: {self.shutter.GetStringSelection()}")
         elif kind == "accessory":
             self.SetStatusText(
                 f"{payload['kind']} {payload['index']}: {payload['value']} (readback)")
@@ -714,6 +804,9 @@ class MainFrame(wx.Frame):
             self.saved.append(payload)
             self._redraw()
             self._map()
+        elif kind == "session":
+            if self.session is not None:
+                self.session.data = payload
         elif kind == "restored_measurements":
             self.saved = payload
             self.last = payload[-1] if payload else None
@@ -721,6 +814,8 @@ class MainFrame(wx.Frame):
             self._map()
             self._set_state(self.worker.state)
         elif kind == "steps":
+            if self.session is not None:
+                self.session.data["steps"] = payload
             self.steps_list.DeleteAllItems()
             for i, item in enumerate(payload):
                 self.steps_list.InsertItem(i, str(item["index"]))
@@ -811,18 +906,92 @@ class MainFrame(wx.Frame):
         if self.worker.state != "DISCONNECTED":
             self._submit("disconnect")
             return
-        simulation = self.mode.GetSelection() == 0
+        simulation = self.mode.GetSelection() == 1
         sdk_root = None
         if not simulation:
-            dialog = wx.TextEntryDialog(self, "Optional Andor SDK root folder (leave blank for discovery)",
-                                        "Native connection")
-            try:
-                if dialog.ShowModal() != wx.ID_OK:
+            sdk_root = self.settings["sdk_root"].strip()
+            if not sdk_root or not Path(sdk_root).is_dir():
+                if not self._choose_sdk_folder(None):
                     return
-                sdk_root = dialog.GetValue().strip() or None
-            finally:
-                dialog.Destroy()
-        self._submit("connect", simulation=simulation, sdk_root=sdk_root)
+                sdk_root = self.settings["sdk_root"]
+        auto_cooler = not simulation and self.auto_cooler.GetValue()
+        try:
+            setpoint = int(self.setpoint.GetValue()) if auto_cooler else None
+        except ValueError:
+            wx.MessageBox("Enter an integer CCD setpoint before connecting with automatic cooling.",
+                          "Invalid setpoint", wx.OK | wx.ICON_ERROR)
+            return
+        self._save_preferences()
+        self._auto_cooler_pending = auto_cooler
+        future = self._submit("connect", simulation=simulation, sdk_root=sdk_root)
+        if auto_cooler:
+            self._set_state(self.worker.state)
+            future.add_done_callback(
+                lambda done: wx.CallAfter(self._finish_auto_cooler_connect, done, setpoint))
+
+    def _finish_auto_cooler_connect(self, connect_future, setpoint):
+        if self._gui_closing:
+            return
+        try:
+            connect_future.result()
+        except Exception:
+            self._auto_cooler_pending = False
+            self._set_state(self.worker.state)
+            return
+        future = self._submit("set_cooler", True, setpoint)
+        future.add_done_callback(lambda done: wx.CallAfter(self._auto_cooler_finished, done))
+
+    def _auto_cooler_finished(self, future):
+        if self._gui_closing:
+            return
+        self._auto_cooler_pending = False
+        self._set_state(self.worker.state)
+
+    def _choose_sdk_folder(self, event):
+        current = self.settings["sdk_root"].strip()
+        if not current or not Path(current).is_dir():
+            current = os.environ.get("ANDOR_SDK_ROOT", "")
+        if not current or not Path(current).is_dir():
+            try:
+                current = str(resolve_dll("sdk2").parent)
+            except Exception:
+                current = ""
+        with wx.DirDialog(self, "Select the installed Andor SDK folder",
+                          defaultPath=current if Path(current).is_dir() else "") as dialog:
+            if dialog.ShowModal() != wx.ID_OK:
+                return False
+            self.settings["sdk_root"] = dialog.GetPath()
+        save_settings(self.settings)
+        self.SetStatusText(f"Andor SDK folder saved: {self.settings['sdk_root']}")
+        return True
+
+    def _auto_cooler_changed(self, event):
+        self.settings["cooler_on_new_connection"] = self.auto_cooler.GetValue()
+        save_settings(self.settings)
+
+    def _save_preferences(self):
+        try:
+            self.settings["ccd_setpoint_c"] = int(self.setpoint.GetValue())
+        except ValueError:
+            pass
+        for key, control in (("exposure_s", self.exposure_s),
+                             ("cycle_s", self.cycle_s)):
+            try:
+                value = float(control.GetValue())
+                if np.isfinite(value) and value >= (0 if key == "cycle_s" else 0.000001):
+                    self.settings[key] = value
+            except ValueError:
+                pass
+        try:
+            value = int(self.accumulations.GetValue())
+            if value > 0:
+                self.settings["accumulations"] = value
+        except ValueError:
+            pass
+        size = self.GetSize()
+        self.settings["window_size"] = [max(640, size.width), max(640, size.height)]
+        self.settings["cooler_on_new_connection"] = self.auto_cooler.GetValue()
+        save_settings(self.settings)
 
     def _session(self, event):
         with wx.DirDialog(self, "Choose a new or existing Krishnan session folder",
@@ -888,10 +1057,10 @@ class MainFrame(wx.Frame):
                 return
         try:
             exposure, cycle, accumulations = self._numbers()
+            self._save_preferences()
             step = Step(uuid.uuid4().hex, len(self.session.data["steps"]) + 1,
                         self.sample.GetValue().strip() or "single",
                         exposure_s=exposure, cycle_s=cycle, accumulations=accumulations)
-            self.worker.stop_event.clear()
             self._submit("capture", step, self.readout, self.advanced)
         except ValueError as exc:
             wx.MessageBox(str(exc), "Invalid capture", wx.OK | wx.ICON_ERROR)
@@ -912,7 +1081,7 @@ class MainFrame(wx.Frame):
             self._session(event)
             if self.session is None:
                 return
-        self.worker.stop_event.clear()
+        self._save_preferences()
         if result[0] == "scan":
             self._submit("scan", *result[1:])
         else:
@@ -924,14 +1093,13 @@ class MainFrame(wx.Frame):
             self._submit("batch", steps, self.readout, self.advanced)
 
     def _resume(self, event):
-        self.worker.stop_event.clear()
         self._submit("resume_batch", self.readout, self.advanced)
 
     def _live(self, event):
         try:
             exposure, cycle, _ = self._numbers()
-            self.worker.stop_event.clear()
-            self.live_future = self._submit("live", exposure, cycle, self.readout)
+            self._save_preferences()
+            self.live_future = self._submit("live", exposure, cycle, self.readout, self.advanced)
         except ValueError as exc:
             wx.MessageBox(str(exc), "Invalid live setting", wx.OK | wx.ICON_ERROR)
 
@@ -939,11 +1107,9 @@ class MainFrame(wx.Frame):
         threading.Thread(target=self.worker.stop, daemon=True).start()
 
     def _trigger(self, event):
-        if self.worker.camera is None:
-            return
         def send():
             try:
-                self.worker.camera.software_trigger()
+                self.worker.software_trigger()
             except Exception as exc:
                 self._post("error", f"Software trigger: {exc}")
         threading.Thread(target=send, daemon=True).start()
@@ -962,7 +1128,6 @@ class MainFrame(wx.Frame):
         self._stop(event)
         def after_live(future):
             if self.worker.state == "IDLE":
-                self.worker.stop_event.clear()
                 self._submit("capture", step, self.readout, self.advanced)
         self.live_future.add_done_callback(after_live)
 
@@ -985,14 +1150,21 @@ class MainFrame(wx.Frame):
         self._submit("configure_calibration_geometry")
 
     def _cooler(self, on):
+        if self.worker.state != "IDLE":
+            wx.MessageBox("Stop acquisition and wait for IDLE before changing the CCD cooler.",
+                          "CCD cooler", wx.OK | wx.ICON_INFORMATION)
+            return
         try:
             setpoint = int(self.setpoint.GetValue()) if on else None
+            self._save_preferences()
             self._submit("set_cooler", on, setpoint)
         except ValueError:
             wx.MessageBox("Enter an integer CCD setpoint.", "Invalid setpoint", wx.OK | wx.ICON_ERROR)
 
     def _shutter(self, event):
-        self._submit("set_shutter", [2, 1, 0][self.shutter.GetSelection()])
+        selection = self.shutter.GetSelection()
+        if selection > 0:
+            self._submit("set_shutter", [None, 2, 1, 0][selection])
 
     def _accessories_dialog(self, event):
         if self.inventory is None or self.worker.state != "IDLE":
@@ -1031,9 +1203,38 @@ class MainFrame(wx.Frame):
                 return
         self._submit("set_accessory", kind, index, value)
 
+    def _show_temperature(self, payload):
+        self._last_temperature_payload = payload
+        try:
+            measured_at = datetime.fromisoformat(payload["observed_utc"])
+            age_s = max(0.0, (datetime.now(timezone.utc) - measured_at).total_seconds())
+        except (KeyError, TypeError, ValueError):
+            age_s = 16.0  # An old backend without a measurement time is not a fresh reading.
+        self._last_temperature_received = time.monotonic() - age_s
+        self._last_temperature_request = self._last_temperature_received
+        self._render_temperature()
+
+    def _render_temperature(self):
+        payload = self._last_temperature_payload
+        if payload is None:
+            return
+        info = payload["reading"]
+        age = max(0, int(time.monotonic() - self._last_temperature_received))
+        prefix = "STALE · " if age > 15 or self.worker.state == "FAULT" else ""
+        self.ccd_status.SetLabel(
+            f"{prefix}{info['celsius']:.1f} °C ({info['status']}); "
+            f"cooler {'on' if payload['cooler_on'] else 'off'} · read {age}s ago"
+            + (f" · SDK read {payload['read_duration_ms']:.0f} ms"
+               if payload.get("read_duration_ms") is not None else ""))
+
     def _poll(self, event):
-        if self.worker.state == "IDLE":
-            self._submit("read_temperature")
+        self._render_temperature()
+        now = time.monotonic()
+        if (self.worker.state == "IDLE" and not self._auto_cooler_pending and
+                now - self._last_temperature_request >= self.settings["temperature_interval_s"] and
+                (self._temperature_future is None or self._temperature_future.done())):
+            self._last_temperature_request = now
+            self._temperature_future = self._submit("read_temperature")
 
     def _export(self, event):
         selected = set()
@@ -1078,16 +1279,59 @@ class MainFrame(wx.Frame):
                          source["axis"], source["data"], selected)
 
     def _close(self, event):
+        self._gui_closing = True
+        self._save_preferences()
         self.timer.Stop()
         self.camera_panel.shutdown()
+        self.console_panel.shutdown()
+        self.motor_panel.shutdown()
         self.Hide()
         threading.Thread(target=self._finish_close, daemon=True).start()
+
+    def _reattach_backend(self):
+        if self.worker._reader.is_alive() and not self.worker._closing:
+            return
+        def attach():
+            queued = []
+            guard = threading.Lock()
+            installed = False
+            def emit(kind, payload):
+                with guard:
+                    if installed:
+                        self._post(kind, payload)
+                    else:
+                        queued.append((kind, payload))
+            try:
+                worker = ProcessWorker(emit)
+            except Exception as exc:
+                self._post("error", str(exc))
+            else:
+                if self._gui_closing:
+                    worker.close()
+                else:
+                    def install():
+                        nonlocal installed
+                        with guard:
+                            self.worker = worker
+                            for kind, payload in queued:
+                                self._post(kind, payload)
+                            queued.clear()
+                            installed = True
+                    wx.CallAfter(install)
+        threading.Thread(target=attach, daemon=True, name="andor-reattach").start()
 
     def _finish_close(self):
         try:
             self.worker.close()
-        finally:
+        except Exception as exc:
+            wx.CallAfter(self._close_failed, str(exc))
+        else:
             wx.CallAfter(self.Destroy)
+
+    def _close_failed(self, message):
+        self.Show()
+        self.Raise()
+        wx.MessageBox(message, "Krishnan could not close safely", wx.OK | wx.ICON_ERROR)
 
 
 def main():

@@ -1,0 +1,23 @@
+{
+  "sdk_root": "",
+  "camera_mode": "simulator",
+  "ccd_setpoint_c": -50,
+  "cooler_on_new_connection": false,
+  "exposure_s": 0.1,
+  "cycle_s": 0.2,
+  "accumulations": 1,
+  "temperature_interval_s": 10,
+  "temperature_log_thresholds_c": [-50, 0, 10, 20],
+  "window_size": [1480, 920],
+  "aravis_dll_dir": "native/aravis/runtime/ucrt64/bin",
+  "aravis_serial": "00000000",
+  "aravis_ip": "0.0.0.0",
+  "aravis_host_ip": "0.0.0.0",
+  "aravis_frame_rate": 14.0,
+  "aravis_packet_delay_us": 20.0,
+  "aravis_warmup_s": 5.0,
+  "aravis_freeze_white_balance": true,
+  "aravis_manage_network": true,
+  "kinesis_sdk_root": "C:\\Program Files\\Thorlabs\\Kinesis",
+  "kinesis_serials": ["55000000"]
+}
